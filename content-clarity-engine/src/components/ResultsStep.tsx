@@ -114,6 +114,8 @@ const ResultsStep = ({ files, findings }: ResultsStepProps) => {
 
   const contradictions = findings.filter((f) => f.type === "Contradiction");
   const drifts = findings.filter((f) => f.type === "Semantic Drift");
+  const stales = findings.filter((f) => f.type === "Stale Reference");
+  const terms = findings.filter((f) => f.type === "Terminology");
 
   const METRICS = [
     { label: "Total Findings", value: findings.length, className: "text-primary" },
@@ -184,15 +186,19 @@ const ResultsStep = ({ files, findings }: ResultsStepProps) => {
         <div className="lg:col-span-2">
           <Tabs defaultValue="all">
             <TabsList className="mb-4">
-              <TabsTrigger value="all">All Findings ({findings.length})</TabsTrigger>
+              <TabsTrigger value="all">All ({findings.length})</TabsTrigger>
               <TabsTrigger value="contradictions">Contradictions ({contradictions.length})</TabsTrigger>
               <TabsTrigger value="drift">Semantic Drift ({drifts.length})</TabsTrigger>
+              <TabsTrigger value="stale">Stale References ({stales.length})</TabsTrigger>
+              <TabsTrigger value="terms">Terminology ({terms.length})</TabsTrigger>
             </TabsList>
 
             <ScrollArea className="h-[600px] pr-2">
               <TabsContent value="all" className="mt-0">{renderFindings(findings)}</TabsContent>
               <TabsContent value="contradictions" className="mt-0">{renderFindings(contradictions)}</TabsContent>
               <TabsContent value="drift" className="mt-0">{renderFindings(drifts)}</TabsContent>
+              <TabsContent value="stale" className="mt-0">{renderFindings(stales)}</TabsContent>
+              <TabsContent value="terms" className="mt-0">{renderFindings(terms)}</TabsContent>
             </ScrollArea>
           </Tabs>
         </div>

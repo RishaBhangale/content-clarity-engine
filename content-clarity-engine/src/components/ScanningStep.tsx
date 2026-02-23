@@ -155,7 +155,6 @@ const ScanningStep = ({ files, config, onComplete }: ScanningStepProps) => {
                 <div className="w-4 h-4 rounded-full border border-border flex-shrink-0" />
               )}
               <span className={`text-sm ${isDone ? "text-foreground" : "text-foreground-muted"}`}>
-                {isDone ? "✓ " : ""}
                 {step.label}
               </span>
             </div>

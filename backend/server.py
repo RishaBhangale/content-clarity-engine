@@ -193,8 +193,8 @@ def is_metadata(text: str) -> bool:
 def is_section_heading(text: str) -> str | None:
     """Check if text is a section heading. If so, return the heading text, else return None."""
     stripped = text.strip()
-    # Matches patterns like "Section 1: Purpose", "3.1 General Data", etc.
-    match = re.match(r"^(?:Section\s+\d+[:\.]|\d+\.\d+)\s+(.+)", stripped, re.IGNORECASE)
+    # Matches patterns like "Section 1: Purpose", "3.1 General Data", "3. EXPENSE REIMBURSEMENT", etc.
+    match = re.match(r"^(?:Section\s+\d+[:\.]|\d+\.\d+|\d+\.)\s+(.+)", stripped, re.IGNORECASE)
     if match:
         # If it's short (≤ 10 words), it's likely a heading, not a numbered list item
         if len(stripped.split()) <= 10:
@@ -704,189 +704,940 @@ def _extract_all_words(text: str) -> list[str]:
 
 def find_semantic_drift(documents: dict, config: dict) -> list[dict]:
     """
-    Semantic Drift Detection (Context Variance):
-    Find terms/phrases that are used with DIFFERENT meanings across documents.
-
+    Semantic Drift Detection — Section-Block Comparison Model.
+    
+    Instead of term-level variance, this compares entire section blocks
+    from different documents to find same-topic, different-process drift.
+    
     Algorithm:
-    1. For each segment, extract all words (no hardcoded verbs/nouns list)
-    2. Build a map: term -> list of (segment, doc_id) where it appears
-    3. Keep only terms appearing in >=2 different documents
-    4. For each such term, embed its contexts grouped by document
-    5. Calculate Context Variance: 
-       - intra_doc_sim: How consistently is the term used within a SINGLE document?
-       - inter_doc_sim: How consistently is the term used ACROSS documents?
-       - True drift = High intra_doc_sim (specific meaning) but low inter_doc_sim (different config/meaning)
-       - Generic verbs/adverbs inherently have low intra_doc_sim, naturally filtering out noise.
+    1. Stitch all sentences in a section into one block per doc
+    2. Embed each section block as a single vector
+    3. Find pairs in the MEDIUM cosine band (0.40–0.74) — same topic, different content
+    4. For those pairs, compute Named Entity Jaccard Divergence
+    5. High topic similarity + low entity overlap = Semantic Drift
     """
     from collections import defaultdict
-
-    # Step 1: Collect and stitch segments by Section Heading.
-    # Comparing full paragraph procedural blocks allows us to detect drift in multi-step workflows.
-    all_segments = []
-    for doc_id, doc in documents.items():
-        doc_sections = defaultdict(lambda: {"text": [], "doc_name": ""})
-        
-        for seg in doc["segments"]:
-            doc_sections[seg["section"]]["text"].append(seg["text"])
-            doc_sections[seg["section"]]["doc_name"] = seg["doc_name"]
-            
-        for section_name, data in doc_sections.items():
-            combined_text = " ".join(data["text"])
-            
-            # Skip tiny sections that don't have enough context to show drift
-            if len(combined_text.split()) < 15:
-                continue
-                
-            terms = _extract_all_words(combined_text)
-            all_segments.append({
-                "text": combined_text,
-                "doc_id": doc_id,
-                "doc_name": data["doc_name"],
-                "section": section_name,
-                "terms": terms,
-            })
-
-    if len(all_segments) < 2:
-        return []
-
-    # Get dynamic corpus stats to lightly penalize extremely common structural words globally
-    # but primarily rely on context variance.
-    corpus_stats = compute_corpus_stats(all_segments)
-    total_segments = corpus_stats["total_segments"]
-    word_counts = corpus_stats["word_counts"]
-
-    # Step 2: Build term -> contexts map
-    term_contexts = defaultdict(list)
-
-    for seg in all_segments:
-        seen_in_seg = set()
-        for term in seg["terms"]:
-            if term not in seen_in_seg:
-                seen_in_seg.add(term)
-                term_contexts[term].append({
-                    "text": seg["text"],
-                    "doc_id": seg["doc_id"],
-                    "doc_name": seg["doc_name"],
-                    "section": seg["section"],
-                })
-
-    # Step 3: Filter to cross-document terms with sufficient presence
-    cross_doc_terms = {}
-    for term, contexts in term_contexts.items():
-        # Exclude extreme generic words (SF > 15%) as they are structural (e.g., "data", "system")
-        # unless it's a very tiny corpus.
-        if total_segments > 20 and (word_counts.get(term, 0) / total_segments) > 0.15:
-            continue
-
-        doc_ids = set(c["doc_id"] for c in contexts)
-        if len(doc_ids) < 2:
-            continue
-        # Need at least a few contexts to establish variance
-        if len(contexts) < 3:
-            continue
-        cross_doc_terms[term] = contexts
-
-    logger.info(f"Semantic drift: {len(cross_doc_terms)} significant cross-doc terms found for variance analysis")
-
-    if not cross_doc_terms:
-        return []
-
-    # Step 4: Embed contexts and compare
-    model = get_embedding_model()
+    import re
 
     sensitivity = config.get("sensitivity", "medium")
-    drift_threshold = {"high": 0.25, "medium": 0.35, "low": 0.45}.get(sensitivity, 0.35)
 
+    # Thresholds for the "medium band" — same topic, diverged content
+    lower_band = {"high": 0.35, "medium": 0.40, "low": 0.45}.get(sensitivity, 0.40)
+    upper_band = {"high": 0.78, "medium": 0.74, "low": 0.70}.get(sensitivity, 0.74)
+
+    # Minimum entity divergence to call it drift (Jaccard below this = diverged)
+    entity_divergence_threshold = {"high": 0.35, "medium": 0.25, "low": 0.15}.get(sensitivity, 0.25)
+
+    # ── Step 1: Build one text block per section per document ──────────────
+    section_blocks = []
+    for doc_id, doc in documents.items():
+        doc_sections = defaultdict(list)
+        for seg in doc["segments"]:
+            doc_sections[seg["section"]].append(seg["text"])
+
+        for section_name, texts in doc_sections.items():
+            combined = " ".join(texts)
+            if len(combined.split()) < 25:   # skip tiny sections
+                continue
+            section_blocks.append({
+                "doc_id":   doc_id,
+                "doc_name": doc["name"],
+                "section":  section_name,
+                "text":     combined,
+            })
+
+    if len(section_blocks) < 2:
+        return []
+
+    # ── Step 2: Embed all section blocks ──────────────────────────────────
+    model = get_embedding_model()
+    embeddings = model.encode(
+        [b["text"] for b in section_blocks],
+        show_progress_bar=False,
+        convert_to_numpy=True,
+    )
+
+    sim_matrix = cosine_similarity(embeddings)
+
+    # ── Step 3: Find cross-document pairs in the medium cosine band ────────
+    candidates = []
+    for i in range(len(section_blocks)):
+        for j in range(i + 1, len(section_blocks)):
+            if section_blocks[i]["doc_id"] == section_blocks[j]["doc_id"]:
+                continue   # same document — skip
+            sim = float(sim_matrix[i][j])
+            if lower_band <= sim <= upper_band:
+                candidates.append((i, j, sim))
+
+    logger.info(f"Semantic drift: {len(candidates)} section pairs in medium cosine band [{lower_band:.2f}–{upper_band:.2f}]")
+
+    if not candidates:
+        return []
+
+    # ── Step 4: Named Entity Jaccard Divergence ────────────────────────────
+    def extract_entities(text: str) -> set:
+        """Extract proper nouns and noun phrases as entity fingerprint."""
+        doc_nlp = nlp(text)
+        entities = set()
+        # spaCy named entities (tools, orgs, people)
+        for ent in doc_nlp.ents:
+            if ent.label_ in ("ORG", "PRODUCT", "PERSON", "GPE", "WORK_OF_ART"):
+                entities.add(ent.text.lower().strip())
+        # Noun chunks with proper nouns (catches "Expensify", "ServiceNow" etc.)
+        for chunk in doc_nlp.noun_chunks:
+            if any(t.pos_ == "PROPN" for t in chunk):
+                entities.add(chunk.text.lower().strip())
+        return entities
+
+    # ── Step 5: Score and build findings ──────────────────────────────────
     findings = []
     finding_id = 0
-    processed_pairs = set()
 
-    for term, contexts in cross_doc_terms.items():
-        # Group contexts by document
-        doc_groups = defaultdict(list)
-        for ctx in contexts:
-            doc_groups[ctx["doc_id"]].append(ctx)
+    for i, j, sim in candidates:
+        blk_a = section_blocks[i]
+        blk_b = section_blocks[j]
 
-        doc_ids = list(doc_groups.keys())
+        ents_a = extract_entities(blk_a["text"])
+        ents_b = extract_entities(blk_b["text"])
 
-        for i in range(len(doc_ids)):
-            for j in range(i + 1, len(doc_ids)):
-                doc_a_id = doc_ids[i]
-                doc_b_id = doc_ids[j]
+        # Only score entity divergence when there ARE entities to compare
+        if ents_a and ents_b:
+            union     = len(ents_a | ents_b)
+            intersect = len(ents_a & ents_b)
+            jaccard   = intersect / union if union > 0 else 1.0
+        elif not ents_a and not ents_b:
+            jaccard = 1.0   # no entities on either side — not a tool/actor drift
+        else:
+            jaccard = 0.0   # one side has entities, other doesn't — likely drift
 
-                pair_key = (term, min(doc_a_id, doc_b_id), max(doc_a_id, doc_b_id))
-                if pair_key in processed_pairs:
+        if jaccard >= entity_divergence_threshold:
+            continue   # entities mostly overlap — same tools, not drift
+
+        # Drift score: higher sim (more on-topic) + lower jaccard (more diverged) = stronger drift
+        drift_score = sim * (1.0 - jaccard)
+
+        if drift_score < 0.25:
+            continue
+
+        # Severity based on drift score
+        if drift_score >= 0.45:
+            severity = "critical"
+        elif drift_score >= 0.35:
+            severity = "warning"
+        else:
+            severity = "info"
+
+        # Build a readable title from section names
+        sec_a = blk_a["section"][:40]
+        sec_b = blk_b["section"][:40]
+        title = (
+            f"Process drift: \"{sec_a}\" described differently"
+            if sec_a.lower() == sec_b.lower()
+            else f"Diverged procedures: \"{sec_a}\" vs \"{sec_b}\""
+        )
+
+        # Diff the unique entities for the suggestion
+        only_a = ents_a - ents_b
+        only_b = ents_b - ents_a
+        entity_note = ""
+        if only_a or only_b:
+            entity_note = (
+                f" Unique to {blk_a['doc_name']}: {', '.join(sorted(only_a)[:4])}. "
+                f"Unique to {blk_b['doc_name']}: {', '.join(sorted(only_b)[:4])}."
+            )
+
+        finding_id += 1
+        findings.append({
+            "id":         finding_id,
+            "severity":   severity,
+            "title":      title,
+            "sourceA":    f"{blk_a['doc_name']} § {blk_a['section']}",
+            "sourceB":    f"{blk_b['doc_name']} § {blk_b['section']}",
+            "type":       "Semantic Drift",
+            "excerptA":   blk_a["text"][:400],
+            "excerptB":   blk_b["text"][:400],
+            "suggestion": (
+                f"These sections cover the same topic but describe different "
+                f"processes, tools, or actors — a sign of independent evolution. "
+                f"Align {blk_a['doc_name']} and {blk_b['doc_name']} on a single "
+                f"canonical process.{entity_note}"
+            ),
+            "confidence": int(min(drift_score * 180, 97)),
+        })
+
+    findings.sort(key=lambda f: f["confidence"], reverse=True)
+    for idx, f in enumerate(findings):
+        f["id"] = idx + 1
+
+    logger.info(f"Semantic drift: {len(findings)} drift findings")
+    return findings
+
+
+# ─────────────────────────────────────────────
+#  Stale Reference Detection
+# ─────────────────────────────────────────────
+
+# Regex patterns for extracting referenceable entities
+_ENTITY_VERSION_PATTERN = re.compile(
+    r'([A-Za-z][A-Za-z0-9\s\-_]{2,25}?)\s+'  # entity name (e.g. "Confluence")
+    r'(?:v(?:ersion)?\s*)(\d+(?:\.\d+)*)',     # version (e.g. "v2.0")
+    re.IGNORECASE
+)
+
+_DATE_PATTERN = re.compile(
+    r"""
+    ((?:January|February|March|April|May|June|July|August|September|
+    October|November|December)
+    (?:\s+\d{1,2},?)?   # ← NEW: optional day (e.g. "10," or "10")
+    \s+\d{4})            # year
+    | (Q[1-4]\s+\d{4})
+    """,
+    re.IGNORECASE | re.VERBOSE
+)
+
+_SECTION_REF_PATTERN = re.compile(
+    r"""
+    (?:Section\s+)(\d+(?:\.\d+)*)                # Section 4.3
+    | (§\s*\d+(?:\.\d+)*)                        # §3.2
+    """, re.IGNORECASE | re.VERBOSE
+)
+
+# ── ADD: dedicated header-level version extractor ──────────────────────
+_HEADER_VERSION_PATTERN = re.compile(
+    r'^(?:Version|Ver|Rev(?:ision)?)\s*[:\-]\s*(\d+(?:\.\d+)*)',
+    re.IGNORECASE | re.MULTILINE
+)
+
+# ── ADD: document metadata extractor (runs on raw text, before segmentation) ──
+def _extract_doc_metadata(text: str, doc_name: str, doc_id: str) -> dict:
+    """
+    Extract structured metadata from document header lines.
+    Works on raw doc["text"] — not filtered segments.
+    Returns: {version, last_updated_raw, last_updated_parsed, doc_name, doc_id}
+    """
+    meta = {"doc_name": doc_name, "doc_id": doc_id,
+            "version": None, "last_updated_raw": None, "last_updated_parsed": None}
+
+    ver_match = _HEADER_VERSION_PATTERN.search(text)
+    if ver_match:
+        meta["version"] = ver_match.group(1)
+        try:
+            meta["version_tuple"] = tuple(int(x) for x in ver_match.group(1).split("."))
+        except ValueError:
+            meta["version_tuple"] = None
+
+    date_match = _DATE_PATTERN.search(text[:500])  # header is always in first 500 chars
+    if date_match:
+        date_str = next((m for m in date_match.groups() if m), None)
+        if date_str:
+            meta["last_updated_raw"] = date_str.strip()
+            meta["last_updated_parsed"] = _parse_date_to_year_quarter(date_str.strip())
+
+    return meta
+
+_SYSTEM_MIGRATION_PATTERN = re.compile(
+    r"""
+    (?:migrated?\s+(?:to|from)|replaced?\s+(?:by|with)|
+       deprecated|retired|sunset|decommissioned|
+       upgraded?\s+(?:to|from)|transitioned?\s+(?:to|from)|
+       moved?\s+(?:to|from)|switched?\s+(?:to|from))
+    \s+(.+?)(?:\.|,|$)
+    """, re.IGNORECASE | re.VERBOSE
+)
+
+
+def _extract_versions_from_text(text: str) -> list[dict]:
+    results = []
+    for match in _ENTITY_VERSION_PATTERN.finditer(text):
+        entity_raw = match.group(1).strip()
+        version_str = match.group(2)
+
+        # Skip if entity looks like a sentence fragment (contains verb indicators)
+        if re.search(r'\b(is|are|was|were|will|has|have|the|a|an)\b',
+                     entity_raw, re.IGNORECASE):
+            continue
+        # Skip very short or very generic entities
+        if len(entity_raw) < 3:
+            continue
+
+        start = max(0, match.start() - 20)
+        end   = min(len(text), match.end() + 40)
+        results.append({
+            "entity":      entity_raw.strip(),
+            "entity_key":  entity_raw.lower().strip(),  # for grouping
+            "version":     version_str,
+            "full_match":  match.group(0).strip(),
+            "context":     text[start:end].strip(),
+        })
+    return results
+
+
+def _extract_dates_from_text(text: str) -> list[dict]:
+    """Extract date references from text."""
+    results = []
+    for match in _DATE_PATTERN.finditer(text):
+        date_str = match.group(1) or match.group(2)
+        if date_str:
+            date_str = date_str.strip()
+            start = max(0, match.start() - 30)
+            end = min(len(text), match.end() + 30)
+            context = text[start:end].strip()
+            results.append({
+                "date": date_str,
+                "context": context,
+            })
+    return results
+
+
+def _extract_section_refs(text: str) -> list[dict]:
+    """Extract section references from text."""
+    results = []
+    for match in _SECTION_REF_PATTERN.finditer(text):
+        section = match.group(1) or match.group(2)
+        if section:
+            section = section.strip().lstrip("§").strip()
+            start = max(0, match.start() - 30)
+            end = min(len(text), match.end() + 30)
+            context = text[start:end].strip()
+            results.append({
+                "section": section,
+                "context": context,
+            })
+    return results
+
+
+def _extract_migration_refs(text: str) -> list[dict]:
+    results = []
+    for match in _SYSTEM_MIGRATION_PATTERN.finditer(text):
+        system = match.group(1).strip() if match.group(1) else ""
+        if not system or len(system) < 3:
+            continue
+
+        # ── NEW GATE: must look like a proper noun / system name ──
+        # Has a capital letter OR is an acronym (2+ uppercase letters)
+        # Rejects "a new approach", "the old process", "an external vendor"
+        if not re.search(r'[A-Z][a-z]|[A-Z]{2,}', system):
+            continue
+        # Reject obvious filler phrases
+        filler = re.compile(
+            r'^(a |an |the |our |new |old |this |that |all |any )', re.IGNORECASE
+        )
+        if filler.match(system):
+            continue
+
+        start = max(0, match.start() - 20)
+        end   = min(len(text), match.end() + 20)
+        results.append({
+            "system":      system,
+            "full_match":  match.group(0).strip(),
+            "context":     text[start:end].strip(),
+        })
+    return results
+
+
+def _parse_date_to_year_quarter(date_str: str) -> tuple[int, int] | None:
+    """Parse a date string to (year, quarter) for comparison."""
+    # Try "Month Year" format
+    month_match = re.match(
+        r"(January|February|March|April|May|June|July|August|September|"
+        r"October|November|December)\s+(\d{4})", date_str, re.IGNORECASE
+    )
+    if month_match:
+        month_name = month_match.group(1).lower()
+        year = int(month_match.group(2))
+        months = {
+            "january": 1, "february": 2, "march": 3, "april": 4,
+            "may": 5, "june": 6, "july": 7, "august": 8,
+            "september": 9, "october": 10, "november": 11, "december": 12,
+        }
+        month_num = months.get(month_name, 1)
+        quarter = (month_num - 1) // 3 + 1
+        return (year, quarter)
+
+    # Try "Q1 2024" format
+    q_match = re.match(r"Q([1-4])\s+(\d{4})", date_str, re.IGNORECASE)
+    if q_match:
+        return (int(q_match.group(2)), int(q_match.group(1)))
+
+    return None
+
+
+def find_stale_references(documents: dict, config: dict) -> list[dict]:
+    """
+    Detect stale references across documents:
+    - Version mismatches (doc A mentions v2.0, but v3 exists)
+    - Outdated dates (doc A says "last reviewed Jan 2023", another shows Mar 2025)
+    - References to deprecated/migrated systems
+    - Section references that don't exist in the target document
+    """
+    findings = []
+    finding_id = 0
+
+    doc_list = list(documents.values())
+    doc_ids = list(documents.keys())
+
+    # Pre-extract all versions, dates, and migration references per document
+    doc_versions = {}   # doc_id -> [{version, full_match, context, doc_name}]
+    doc_dates = {}      # doc_id -> [{date, context, doc_name}]
+    doc_migrations = {} # doc_id -> [{system, full_match, context}]
+    doc_sections = {}   # doc_id -> set of section numbers found in the doc
+
+    for doc_id, doc in documents.items():
+        full_text = doc["text"]
+        doc_name = doc["name"]
+
+        # Extract versions
+        versions = _extract_versions_from_text(full_text)
+        for v in versions:
+            v["doc_name"] = doc_name
+            v["doc_id"] = doc_id
+        doc_versions[doc_id] = versions
+
+        # Extract dates
+        dates = _extract_dates_from_text(full_text)
+        for d in dates:
+            d["doc_name"] = doc_name
+            d["doc_id"] = doc_id
+        doc_dates[doc_id] = dates
+
+        # Extract migration references
+        migrations = _extract_migration_refs(full_text)
+        for m in migrations:
+            m["doc_name"] = doc_name
+            m["doc_id"] = doc_id
+        doc_migrations[doc_id] = migrations
+
+        # Extract all section numbers defined in this doc
+        sections = set()
+        for seg in doc["segments"]:
+            sec_num = seg.get("section", "").lstrip("§").strip()
+            if sec_num:
+                sections.add(sec_num)
+        # Also find explicit "Section X" declarations in the full text
+        for match in re.finditer(r"Section\s+(\d+(?:\.\d+)*)", full_text, re.IGNORECASE):
+            sections.add(match.group(1))
+        doc_sections[doc_id] = sections
+
+    # --- Check 1: Version mismatches across documents ---
+    from collections import defaultdict
+
+    # Build: entity_key → list of {version_tuple, doc_name, doc_id, context}
+    entity_version_map = defaultdict(list)
+    for doc_id, doc in documents.items():
+        for v in _extract_versions_from_text(doc["text"]):
+            try:
+                vtuple = tuple(int(x) for x in v["version"].split("."))
+            except ValueError:
+                continue
+            entity_version_map[v["entity_key"]].append({
+                **v,
+                "version_tuple": vtuple,
+                "doc_id":        doc_id,
+                "doc_name":      doc["name"],
+            })
+
+    for entity_key, refs in entity_version_map.items():
+        # Only flag if the same entity appears in 2+ different documents with different versions
+        cross_doc = [r for r in refs if r["doc_id"] != refs[0]["doc_id"]]
+        if not cross_doc:
+            continue
+
+        all_versions = sorted(refs, key=lambda r: r["version_tuple"])
+        oldest = all_versions[0]
+        newest = all_versions[-1]
+
+        if oldest["version_tuple"] == newest["version_tuple"]:
+            continue  # all same version — no issue
+        if oldest["doc_id"] == newest["doc_id"]:
+            continue  # both in same doc — internal versioning, not stale
+
+        # Severity: major version gap = warning, minor = info
+        major_gap = newest["version_tuple"][0] - oldest["version_tuple"][0]
+        severity = "warning" if major_gap >= 1 else "info"
+
+        finding_id += 1
+        findings.append({
+            "id":         finding_id,
+            "severity":   severity,
+            "title":      f"Version mismatch: \"{oldest['entity']}\" {oldest['full_match']} vs {newest['full_match']}",
+            "sourceA":    oldest["doc_name"],
+            "sourceB":    newest["doc_name"],
+            "type":       "Stale Reference",
+            "excerptA":   oldest["context"],
+            "excerptB":   newest["context"],
+            "suggestion": (
+                f"'{oldest['doc_name']}' references {oldest['full_match']} "
+                f"but '{newest['doc_name']}' references {newest['full_match']}. "
+                f"Confirm which version is current and update the older document."
+            ),
+            "confidence": 85 if major_gap >= 1 else 70,
+        })
+
+    # --- Check 2: Deprecated/migrated system references ---
+    # Collect all migration events across documents
+    all_migrations = []
+    for doc_id, migrations in doc_migrations.items():
+        all_migrations.extend(migrations)
+
+    # For each document, check if it references a system that's been migrated
+    if all_migrations:
+        for doc_id, doc in documents.items():
+            full_text_lower = doc["text"].lower()
+            for migration in all_migrations:
+                if migration["doc_id"] == doc_id:
+                    continue  # Don't flag the doc that declares the migration
+
+                system_lower = migration["system"].lower()
+                # Check if this doc still references the migrated-to/from system
+                # We look for the system name in the document text
+                if system_lower in full_text_lower:
+                    # Find the actual mention in context
+                    idx = full_text_lower.find(system_lower)
+                    if idx >= 0:
+                        ctx_start = max(0, idx - 40)
+                        ctx_end = min(len(doc["text"]), idx + len(migration["system"]) + 40)
+                        mention_context = doc["text"][ctx_start:ctx_end].strip()
+
+                        finding_id += 1
+                        findings.append({
+                            "id": finding_id,
+                            "severity": "warning",
+                            "title": f"Reference to migrated/deprecated system: {migration['system']}",
+                            "sourceA": doc["name"],
+                            "sourceB": migration["doc_name"],
+                            "type": "Stale Reference",
+                            "excerptA": mention_context,
+                            "excerptB": migration["context"],
+                            "suggestion": (
+                                f"'{doc['name']}' still references '{migration['system']}', "
+                                f"but '{migration['doc_name']}' indicates this has been "
+                                f"migrated/deprecated. Update the reference accordingly."
+                            ),
+                            "confidence": 85,
+                        })
+
+    # --- Check 3: Date discrepancies ---
+    # Find cases where one doc references a significantly older date for a shared topic
+    all_dates = []
+    for doc_id, dates in doc_dates.items():
+        for d in dates:
+            parsed = _parse_date_to_year_quarter(d["date"])
+            if parsed:
+                all_dates.append({**d, "parsed": parsed})
+
+    for i, da in enumerate(all_dates):
+        for j, db in enumerate(all_dates):
+            if i >= j:
+                continue
+            if da["doc_id"] == db["doc_id"]:
+                continue
+
+            # Check context overlap
+            ctx_words_a = set(re.findall(r"[a-z]{3,}", da["context"].lower()))
+            ctx_words_b = set(re.findall(r"[a-z]{3,}", db["context"].lower()))
+            shared = ctx_words_a & ctx_words_b - _STOP_WORDS
+            if len(shared) < 1:
+                continue
+
+            # Compare dates — flag if more than 1 year apart
+            year_diff = abs(da["parsed"][0] - db["parsed"][0])
+            if year_diff >= 2:
+                older = da if da["parsed"] < db["parsed"] else db
+                newer = db if da["parsed"] < db["parsed"] else da
+
+                finding_id += 1
+                findings.append({
+                    "id": finding_id,
+                    "severity": "info",
+                    "title": f"Outdated date reference: {older['date']} vs {newer['date']}",
+                    "sourceA": older["doc_name"],
+                    "sourceB": newer["doc_name"],
+                    "type": "Stale Reference",
+                    "excerptA": older["context"],
+                    "excerptB": newer["context"],
+                    "suggestion": (
+                        f"'{older['doc_name']}' references '{older['date']}', "
+                        f"but '{newer['doc_name']}' shows '{newer['date']}'. "
+                        f"Check whether the older date is still accurate."
+                    ),
+                    "confidence": 70,
+                })
+
+    # ── Check 4: Dangling section references ──────────────────────────────
+    # "See Section 4.3" in Doc A, but Section 4.3 doesn't exist in any other doc
+
+    for doc_id, doc in documents.items():
+        refs = _extract_section_refs(doc["text"])
+        for ref in refs:
+            ref_num = ref["section"]
+
+            # Check if this section number exists in ANY other document
+            found_in_other = False
+            for other_id, other_doc in documents.items():
+                if other_id == doc_id:
                     continue
-                processed_pairs.add(pair_key)
+                # Does that doc actually define that section?
+                if ref_num in doc_sections.get(other_id, set()):
+                    found_in_other = True
+                    break
 
-                contexts_a = doc_groups[doc_a_id]
-                contexts_b = doc_groups[doc_b_id]
+            # Also check within same doc (internal cross-ref)
+            found_internal = ref_num in doc_sections.get(doc_id, set())
 
-                texts_a = [c["text"] for c in contexts_a]
-                texts_b = [c["text"] for c in contexts_b]
+            if not found_in_other and not found_internal:
+                finding_id += 1
+                findings.append({
+                    "id":         finding_id,
+                    "severity":   "info",
+                    "title":      f"Dangling section reference: Section {ref_num}",
+                    "sourceA":    doc["name"],
+                    "sourceB":    "—",
+                    "type":       "Stale Reference",
+                    "excerptA":   ref["context"],
+                    "excerptB":   "",
+                    "suggestion": (
+                        f"'{doc['name']}' references Section {ref_num} "
+                        f"but this section doesn't exist in any loaded document. "
+                        f"The referenced section may have been removed or renumbered."
+                    ),
+                    "confidence": 65,
+                })
 
-                emb_a = model.encode(texts_a, show_progress_bar=False, convert_to_numpy=True)
-                emb_b = model.encode(texts_b, show_progress_bar=False, convert_to_numpy=True)
+    # ── Check 5: Document-level staleness via Last Updated gap ──────────────
+    # Rationale: two docs covering the same sections but with >12-month update gap
+    # = the older one may contain stale procedures relative to the newer one.
 
-                # Measure Inter-Doc Similarity early to use as penalty baseline
-                sim_matrix = cosine_similarity(emb_a, emb_b)
-                max_inter = float(np.max(sim_matrix))
+    doc_metas = [_extract_doc_metadata(doc["text"], doc["name"], doc_id)
+                 for doc_id, doc in documents.items()]
+    doc_metas = [m for m in doc_metas if m["last_updated_parsed"]]
 
-                # Measure Intra-Doc Similarity (consistency within the same document)
-                # If term appears only once in a doc, its internal consistency is unproven.
-                # Default to max_inter to prevent inflating the drift score of generic words.
-                intra_a = float(np.mean(cosine_similarity(emb_a, emb_a))) if len(texts_a) > 1 else max_inter
-                intra_b = float(np.mean(cosine_similarity(emb_b, emb_b))) if len(texts_b) > 1 else max_inter
-                avg_intra = (intra_a + intra_b) / 2.0
+    # Build section-name sets per doc for topic overlap check
+    doc_section_names = {}
+    for doc_id, doc in documents.items():
+        sections = set()
+        for seg in doc["segments"]:
+            sec = seg.get("section", "").strip()
+            if sec and sec.lower() not in {"general", "purpose", "scope", "introduction"}:
+                sections.add(sec.lower())
+        doc_section_names[doc_id] = sections
 
-                # Generic verbs/adverbs ("requires", "within") have low avg_intra because they appear in random disconnected sentences.
-                # If avg_intra is low, it's a generic word, skip drift analysis.
-                if avg_intra < 0.60:
-                    continue
+    for i, ma in enumerate(doc_metas):
+        for j, mb in enumerate(doc_metas):
+            if i >= j:
+                continue
+            if not ma["last_updated_parsed"] or not mb["last_updated_parsed"]:
+                continue
 
-                # Measure Inter-Doc Similarity
-                sim_matrix = cosine_similarity(emb_a, emb_b)
-                max_inter = float(np.max(sim_matrix))
+            year_diff = abs(ma["last_updated_parsed"][0] - mb["last_updated_parsed"][0])
+            # Only flag if documents are > 12 months apart in last-updated date
+            if year_diff < 1:
+                continue
 
-                # DRIFT = High internal consistency, but low cross-document similarity
-                drift_score = avg_intra - max_inter
+            # Topic overlap gate: share at least 1 section keyword
+            # (generalised — no hardcoded topics)
+            secs_a = doc_section_names.get(ma["doc_id"], set())
+            secs_b = doc_section_names.get(mb["doc_id"], set())
 
-                if drift_score > drift_threshold:
-                    min_idx = np.unravel_index(np.argmin(sim_matrix), sim_matrix.shape)
-                    best_ctx_a = contexts_a[min_idx[0]]
-                    best_ctx_b = contexts_b[min_idx[1]]
+            # Word-level overlap across section names
+            words_a = {w for s in secs_a for w in s.split() if len(w) > 4}
+            words_b = {w for s in secs_b for w in s.split() if len(w) > 4}
+            shared_topic_words = words_a & words_b - _STOP_WORDS
 
-                    if drift_score > 0.50:
-                        severity = "critical"
-                    elif drift_score > 0.40:
-                        severity = "warning"
-                    else:
-                        severity = "info"
+            if not shared_topic_words:
+                continue  # completely different topics — not a staleness signal
 
-                    finding_id += 1
-                    findings.append({
-                        "id": finding_id,
-                        "severity": severity,
-                        "title": f"Term \"{term}\" used differently across documents",
-                        "sourceA": f"{best_ctx_a['doc_name']} {best_ctx_a['section']}",
-                        "sourceB": f"{best_ctx_b['doc_name']} {best_ctx_b['section']}",
-                        "type": "Semantic Drift",
-                        "excerptA": best_ctx_a["text"],
-                        "excerptB": best_ctx_b["text"],
-                        "suggestion": (
-                            f"The term \"{term}\" appears to be used with different meanings in "
-                            f"{best_ctx_a['doc_name']} vs {best_ctx_b['doc_name']}. "
-                            f"Consider standardizing the terminology or adding clarifying "
-                            f"context to avoid ambiguity across teams."
-                        ),
-                        "confidence": int(min(drift_score * 150, 99)), # Scale up for UI
-                    })
+            older = ma if ma["last_updated_parsed"] < mb["last_updated_parsed"] else mb
+            newer = mb if ma["last_updated_parsed"] < mb["last_updated_parsed"] else ma
 
+            finding_id += 1
+            findings.append({
+                "id": finding_id,
+                "severity": "warning" if year_diff >= 1 else "info",
+                "title": f"Potentially stale document: last updated {older['last_updated_raw']}",
+                "sourceA": older["doc_name"],
+                "sourceB": newer["doc_name"],
+                "type": "Stale Reference",
+                "excerptA": f"Last Updated: {older['last_updated_raw']}",
+                "excerptB": f"Last Updated: {newer['last_updated_raw']}",
+                "suggestion": (
+                    f"'{older['doc_name']}' was last updated {older['last_updated_raw']}, "
+                    f"but '{newer['doc_name']}' was updated {newer['last_updated_raw']}. "
+                    f"Both cover overlapping topics ({', '.join(list(shared_topic_words)[:3])}). "
+                    f"Review '{older['doc_name']}' for procedures that may have changed."
+                ),
+                "confidence": 70 if year_diff >= 1 else 55,
+            })
+
+    # Sort by confidence (highest first)
     findings.sort(key=lambda f: f["confidence"], reverse=True)
     for i, f in enumerate(findings):
         f["id"] = i + 1
 
-    logger.info(f"Semantic drift: detected {len(findings)} drift findings using variance model")
+    logger.info(f"Stale reference detection: found {len(findings)} issues")
+    return findings
+
+
+# ─────────────────────────────────────────────
+#  Terminology Inconsistency Detection
+# ─────────────────────────────────────────────
+
+def _is_abbreviation(short: str, long: str) -> bool:
+    """Check if 'short' could be an abbreviation/acronym of 'long'."""
+    short_upper = short.upper().strip()
+    long_lower = long.lower().strip()
+    short_lower = short.lower().strip()
+
+    # Direct acronym check: "MFA" -> "multi-factor authentication"
+    long_words = long_lower.split()
+    if len(short_upper) >= 2 and len(long_words) >= 2:
+        initials = "".join(w[0] for w in long_words if w).upper()
+        if short_upper == initials:
+            return True
+
+    # Short form check: if the short string is contained in the long one
+    if len(short) >= 3 and short_lower in long_lower:
+        return True
+
+    return False
+
+
+def _string_similarity(a: str, b: str) -> float:
+    """Simple character-level similarity ratio between two strings."""
+    a_lower, b_lower = a.lower(), b.lower()
+    if a_lower == b_lower:
+        return 1.0
+
+    # Use set intersection of character bigrams
+    def bigrams(s):
+        return set(s[i:i+2] for i in range(len(s) - 1)) if len(s) > 1 else {s}
+
+    bg_a = bigrams(a_lower)
+    bg_b = bigrams(b_lower)
+
+    if not bg_a or not bg_b:
+        return 0.0
+
+    intersection = len(bg_a & bg_b)
+    union = len(bg_a | bg_b)
+    return intersection / union if union > 0 else 0.0
+
+
+def _normalize_term(term: str) -> str:
+    """Reduce term to its root form for inflection comparison."""
+    t = term.lower().strip()
+    # Strip common inflection suffixes
+    t = re.sub(r'\b(\w+)ing\b', lambda m: m.group(1), t)   # meeting → meet
+    t = re.sub(r'\b(\w+)ed\b',  lambda m: m.group(1), t)   # exceeded → exceed
+    t = re.sub(r'\b(\w+)s\b',   lambda m: m.group(1), t)   # exceeds → exceed
+    t = re.sub(r'\b(\w+)ly\b',  lambda m: m.group(1), t)   # usually → usual
+    return t.strip()
+
+
+def find_terminology_inconsistencies(documents: dict, config: dict) -> list[dict]:
+    """
+    Detect terminology inconsistencies across documents:
+    - Different terms used for the same concept (e.g., "customer" vs "client")
+    - Abbreviations vs full forms (e.g., "MFA" vs "multi-factor authentication")
+    - Variant naming (e.g., "offboarding" vs "exit process")
+
+    Approach:
+    1. Extract key noun phrases from each document using spaCy Named Entity Extraction
+    2. Embed them using the existing embedding model
+    3. Find cross-document pairs with high embedding similarity but different surface forms
+    """
+    def _clean_text_for_terms(text: str) -> str:
+        """
+        Prepare text for NER by removing list/step MARKERS
+        but preserving the content of bullet lines.
+        Critical: tool names live inside Step/bullet lines — don't discard them.
+        """
+        clean = []
+        for line in text.split("\n"):
+            s = line.strip()
+            if len(s) < 4:
+                continue
+            # Strip markers but KEEP content
+            s = re.sub(r'^[-•*]\s+', '', s)                     # "- Concur" → "Concur"
+            s = re.sub(r'^Step\s+\d+[:\-]?\s*', '', s)          # "Step 2: Upload..." → "Upload..."
+            s = re.sub(r'^\d+[.\)]\s+', '', s)                  # "1. Submit..." → "Submit..."
+            s = s.strip()
+            if len(s) >= 4:
+                clean.append(s)
+        return " ".join(clean)
+
+    def extract_terms_for_terminology(text: str) -> set:
+        clean = _clean_text_for_terms(text)
+        doc_nlp = nlp(clean)
+        terms = set()
+
+        for ent in doc_nlp.ents:
+            if ent.label_ in ("ORG", "PRODUCT", "PERSON", "GPE", "WORK_OF_ART"):
+                t = ent.text.lower().strip()
+                # Must be at least 3 chars and not a pure number
+                if len(t) >= 3 and not re.match(r'^[\d\s\-\.]+$', t):
+                    terms.add(t)
+
+        for chunk in doc_nlp.noun_chunks:
+            if any(tok.pos_ == "PROPN" for tok in chunk):
+                t = chunk.text.lower().strip()
+                # Drop leading articles
+                t = re.sub(r'^(the|a|an|this|that)\s+', '', t)
+                if len(t) >= 3 and " " in t:  # only multi-word noun phrases
+                    terms.add(t)
+
+        from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
+        common_words_set = {"this", "that", "these", "those", "here", "there"}
+        # Single proper noun tokens (catches tool/system names spaCy NER might miss)
+        for token in doc_nlp:
+            if token.pos_ == "PROPN":
+                t = token.text.lower().strip()
+                # Must be: alphabetic, non-trivial length, not a common word
+                if (len(t) >= 4
+                        and t.isalpha()
+                        and t not in _STOP_WORDS
+                        and t not in common_words_set):
+                    terms.add(t)
+
+        return terms
+
+    findings = []
+    finding_id = 0
+
+    # Step 1: Extract unique terms per document
+    doc_terms = {}  # doc_id -> {term: (doc_name, context_text)}
+    for doc_id, doc in documents.items():
+        terms = {}
+        for seg in doc["segments"]:
+            subjects = extract_terms_for_terminology(seg["text"])
+            for subj in subjects:
+                # Only keep multi-word phrases and meaningful single words
+                if " " in subj or len(subj) > 4:
+                    if subj not in terms:
+                        terms[subj] = {
+                            "doc_name": doc["name"],
+                            "context": seg["text"],
+                            "section": seg.get("section", ""),
+                        }
+        doc_terms[doc_id] = terms
+
+    # Step 2: Build term lists for cross-document comparison
+    # Collect all unique terms per document with their metadata
+    all_term_entries = []  # [{term, doc_id, doc_name, context, section}]
+    for doc_id, terms in doc_terms.items():
+        for term, meta in terms.items():
+            all_term_entries.append({
+                "term": term,
+                "doc_id": doc_id,
+                "doc_name": meta["doc_name"],
+                "context": meta["context"],
+                "section": meta["section"],
+            })
+
+    if len(all_term_entries) < 2:
+        return []
+
+    logger.info(f"Terminology detection: {len(all_term_entries)} terms from {len(documents)} documents")
+
+    # Step 3: Embed all terms in contextual sentences
+    model = get_embedding_model()
+    contextualized_texts = []
+    for e in all_term_entries:
+        ctx = e["context"][:120].replace("\n", " ")
+        contextualized_texts.append(f'The term "{e["term"]}" as used: {ctx}')
+
+    term_embeddings = model.encode(
+        contextualized_texts, show_progress_bar=False, convert_to_numpy=True
+    )
+
+    # Step 4: Find cross-document pairs with high embedding similarity
+    # but different surface forms
+    sim_matrix = cosine_similarity(term_embeddings)
+
+    seen_pairs = set()  # Avoid duplicate findings for the same term pair
+    similarity_threshold = 0.80
+
+    for i in range(len(all_term_entries)):
+        for j in range(i + 1, len(all_term_entries)):
+            entry_a = all_term_entries[i]
+            entry_b = all_term_entries[j]
+
+            # Must be from different documents
+            if entry_a["doc_id"] == entry_b["doc_id"]:
+                continue
+
+            # Must have high embedding similarity
+            emb_sim = float(sim_matrix[i][j])
+            if emb_sim < similarity_threshold:
+                continue
+
+            term_a = entry_a["term"]
+            term_b = entry_b["term"]
+
+            # Must be different surface forms
+            if term_a.lower() == term_b.lower():
+                continue
+
+            # NEW: Section number string leak check
+            if re.match(r'^\d+[\.\d]*\s+', term_a) or re.match(r'^\d+[\.\d]*\s+', term_b):
+                continue  # section number leaked into term — skip
+
+            # NEW: Inflection root check
+            if _normalize_term(term_a) == _normalize_term(term_b):
+                continue  # Same root — grammatical variant, not a terminology issue
+
+            # Must have low string similarity (they should look different)
+            str_sim = _string_similarity(term_a, term_b)
+            if str_sim > 0.75:
+                # Too similar in spelling — likely minor variant, not worth flagging
+                continue
+
+            # Create a canonical pair key to avoid duplicates
+            pair_key = tuple(sorted([term_a.lower(), term_b.lower()]))
+            if pair_key in seen_pairs:
+                continue
+            seen_pairs.add(pair_key)
+
+            # Determine severity
+            is_abbrev = _is_abbreviation(term_a, term_b) or _is_abbreviation(term_b, term_a)
+            if is_abbrev:
+                severity = "info"
+                title = f"Abbreviation vs full form: '{term_a}' / '{term_b}'"
+            else:
+                severity = "warning"
+                title = f"Terminology inconsistency: '{term_a}' vs '{term_b}'"
+
+            confidence = int(emb_sim * 100)
+
+            finding_id += 1
+            findings.append({
+                "id": finding_id,
+                "severity": severity,
+                "title": title,
+                "sourceA": f"{entry_a['doc_name']} {entry_a['section']}",
+                "sourceB": f"{entry_b['doc_name']} {entry_b['section']}",
+                "type": "Terminology",
+                "excerptA": entry_a["context"],
+                "excerptB": entry_b["context"],
+                "suggestion": (
+                    f"The term '{term_a}' in '{entry_a['doc_name']}' and "
+                    f"'{term_b}' in '{entry_b['doc_name']}' appear to refer to the "
+                    f"same concept. Standardize on one term and update all documents. "
+                    f"Consider adding the chosen term to a corporate glossary."
+                ),
+                "confidence": confidence,
+            })
+
+    # Sort by confidence (highest first)
+    findings.sort(key=lambda f: f["confidence"], reverse=True)
+    for i, f in enumerate(findings):
+        f["id"] = i + 1
+
+    # Limit to top findings to avoid noise
+    max_findings = 20
+    if len(findings) > max_findings:
+        findings = findings[:max_findings]
+
+    logger.info(f"Terminology detection: found {len(findings)} inconsistencies")
     return findings
 
 
@@ -1003,6 +1754,20 @@ def scan_documents():
     for df in drift_findings:
         df["id"] = df["id"] + offset
     findings.extend(drift_findings)
+
+    # Run stale reference detection
+    stale_findings = find_stale_references(docs_to_scan, config)
+    offset = len(findings)
+    for sf in stale_findings:
+        sf["id"] = sf["id"] + offset
+    findings.extend(stale_findings)
+
+    # Run terminology inconsistency detection
+    term_findings = find_terminology_inconsistencies(docs_to_scan, config)
+    offset = len(findings)
+    for tf in term_findings:
+        tf["id"] = tf["id"] + offset
+    findings.extend(term_findings)
 
     # Build summary (covers all finding types)
     summary = {
