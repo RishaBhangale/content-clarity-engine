@@ -1,0 +1,41 @@
+Security Controls Audit Report 2025
+Date: February 2025
+Prepared by: Security Team
+
+Section 1: Executive Summary
+This audit evaluates the effectiveness of security controls across the organization. Overall security posture has improved from the previous year.
+
+Section 2: Access Control
+Access to all systems requires multi-factor authentication. Single sign-on is mandatory for all internal applications. Temporary access grants expire after 14 days.
+
+Section 3: Data Classification
+The organization maintains four data classification tiers: Public, Internal, Confidential, and Restricted. All data must be classified upon creation.
+
+Section 4: Security Reviews
+4.1 Review Frequency
+Security control reviews must be conducted on a quarterly basis, with findings reported to the CISO within 5 business days.
+
+4.2 Review Scope
+Reviews cover all security controls including access management, encryption, incident response, and data handling.
+
+Section 5: Password Policy
+5.1 Requirements
+Passwords must be a minimum of 12 characters and include uppercase, lowercase, numbers, and special characters. Password rotation occurs every 60 days.
+
+5.2 MFA
+All accounts must have MFA enabled. SMS-based MFA is no longer accepted; only authenticator apps and hardware tokens are allowed.
+
+Section 6: Incident Response
+Critical incidents escalate to: Team Lead then Security Manager then CISO then CTO within 1 hour. All incidents must be documented within 24 hours.
+
+Section 7: Encryption Standards
+All data at rest must be encrypted using AES-256. Data in transit requires TLS 1.3. Legacy TLS versions are explicitly prohibited.
+
+Section 8: Backup and Recovery
+Backups are performed every 6 hours and retained for 60 days. Full disaster recovery tests are conducted quarterly.
+
+Section 9: Employee Training
+All employees must complete annual security awareness training. New employees must complete training within their first week. Refresher courses are required after any security incident.
+
+Section 10: Vendor Security
+All third-party vendors handling company data must complete a SOC2 Type II audit annually. Vendors with access to Restricted data must also provide ISO 27001 certification.

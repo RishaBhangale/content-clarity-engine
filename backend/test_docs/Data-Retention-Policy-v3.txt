@@ -1,0 +1,35 @@
+Data Retention Policy v3
+Effective Date: January 2025
+Department: Compliance
+
+Section 1: Purpose
+This policy defines the organization's requirements for retaining and disposing of data across all business units.
+
+Section 2: Data Classification
+Data is classified into three levels: Public, Internal, and Confidential. Each classification level has different retention requirements.
+
+Section 3: Retention Periods
+3.1 General Data
+All customer data must be retained for a minimum of 90 days after account closure, after which it shall be permanently deleted from all systems including backups.
+
+3.2 Financial Records
+Financial records must be maintained for 7 years in compliance with SOX requirements. This includes all transaction logs, invoices, and payment records.
+
+3.3 Employee Records
+Employee personnel files shall be retained for 3 years after the date of separation from the organization.
+
+Section 4: Data Deletion
+4.1 Deletion Methods
+All data deletion must use DOD 5220.22-M standard overwrite method. Simple file deletion or formatting is not acceptable for confidential data.
+
+4.2 Deletion Schedule
+Data deletion occurs on a monthly cycle. The compliance team reviews deletion candidates on the first business day of each month.
+
+Section 5: Access Control
+Access to retained data requires manager approval and must be logged in the access audit system. All access requests expire after 30 days.
+
+Section 6: Backup Policy
+Backups are performed daily and retained for 30 days. Monthly snapshots are retained for 1 year.
+
+Section 7: Review
+This policy is reviewed annually by the compliance committee. The next review is scheduled for January 2026.
