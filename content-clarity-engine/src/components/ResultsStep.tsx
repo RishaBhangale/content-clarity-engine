@@ -113,6 +113,7 @@ const ResultsStep = ({ files, findings }: ResultsStepProps) => {
   const infos = findings.filter((f) => f.severity === "info");
 
   const contradictions = findings.filter((f) => f.type === "Contradiction");
+  const drifts = findings.filter((f) => f.type === "Semantic Drift");
 
   const METRICS = [
     { label: "Total Findings", value: findings.length, className: "text-primary" },
@@ -185,11 +186,13 @@ const ResultsStep = ({ files, findings }: ResultsStepProps) => {
             <TabsList className="mb-4">
               <TabsTrigger value="all">All Findings ({findings.length})</TabsTrigger>
               <TabsTrigger value="contradictions">Contradictions ({contradictions.length})</TabsTrigger>
+              <TabsTrigger value="drift">Semantic Drift ({drifts.length})</TabsTrigger>
             </TabsList>
 
             <ScrollArea className="h-[600px] pr-2">
               <TabsContent value="all" className="mt-0">{renderFindings(findings)}</TabsContent>
               <TabsContent value="contradictions" className="mt-0">{renderFindings(contradictions)}</TabsContent>
+              <TabsContent value="drift" className="mt-0">{renderFindings(drifts)}</TabsContent>
             </ScrollArea>
           </Tabs>
         </div>
